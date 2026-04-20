@@ -1,8 +1,27 @@
 # Llama Proxy — Session → Slot
 
-[English](#english) | [中文](#chinese)
+```mermaid
+graph TD
+  Agent["Agent / Client"]
+  Proxy["Llama Proxy"]
+  Slots["Server Slots"]
+  LServer["llama-server"]
+  Monitor["Monitor (SSH tail)"]
+
+  Agent -->|POST /v1/chat/completions| Proxy
+  Proxy -->|compute session_id\n(hash of first 3 messages)| Proxy_note[/"Compute session_id\n(hash of first 3 messages)"/]
+  Proxy_note --> Proxy
+  Proxy -->|forward to mapped slot (id_slot)| Slots
+  Slots -->|internal handling\n(shared KV with --kv-unified)| LServer
+  Monitor -->|ssh tail -F /tmp/llama.log| LServer
+  LServer -->|log lines (includes prefill progress when -lv 4)| Monitor
+  Monitor -->|update UI with Prefill & slot metrics| Proxy
+  Proxy -->|response stream / JSON| Agent
+```
 
 ---
+
+[English](#english) | [中文](#chinese)
 
 <a name="english"></a>
 ## English
@@ -110,34 +129,6 @@ Integration notes for agents:
 - Point your agent's model endpoint to the proxy URL (e.g., `http://<proxy-host>:8888/v1/chat/completions`) instead of the llama-server URL.
 - Keep the OpenAI Chat Completions request shape (messages array).
 - Provide a stable `user` field or deterministic system prompt to help session hashing and source detection.
-
-### Architecture (sequence diagram)
-The monitor uses SSH to tail the remote llama-server log and extracts Prefill progress lines. GitHub supports Mermaid diagrams in READMEs, so you can view this visual directly on GitHub.
-
-```mermaid
-sequenceDiagram
-  participant Agent as Agent / Client
-  participant Proxy as Llama Proxy
-  participant Slots as Llama Server Slots
-  participant LServer as llama-server
-  participant Monitor as Monitor (SSH tail)
-
-  Agent->>Proxy: POST /v1/chat/completions
-  Proxy->>Proxy: compute session_id (hash of first 3 messages)
-  Proxy->>Slots: forward to mapped slot (id_slot)
-  Slots->>LServer: internal handling (shared KV with --kv-unified)
-  Monitor->>LServer: ssh tail -F /tmp/llama.log
-  LServer->>Monitor: log lines (includes prefill progress with -lv 4)
-  Monitor->>Proxy: update UI with Prefill & slot metrics
-```
-
-### Troubleshooting
-- Prefill shows `waiting...` while model responds quickly:
-  - Fast responses may skip verbose prefill log lines. Inspect `proxy.log` and `llama.log` for parsing clues.
-- Unexpected slot eviction / context loss:
-  - Verify `--cache-ram 0` when using `--kv-unified`. Inspect `/proxy/status` for `evict_score` and consider increasing slots or server `--parallel`.
-- Session mismatch due to differing system prompts:
-  - Avoid timestamps or ephemeral metadata in system prompts. Use deterministic system prompts or set a stable `user` field.
 
 ---
 
