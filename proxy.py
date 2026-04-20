@@ -29,6 +29,7 @@ from typing import Optional
 import aiohttp
 import yaml
 from aiohttp import web
+from source_detector import detect_source
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,6 +69,7 @@ class SlotInfo:
     latest_token: str = ""
     matched_chars: int = 0
     new_chars: int = 0
+    source: str = ""
 
     def is_idle(self) -> bool:
         return self.session_id is None
@@ -158,6 +160,7 @@ class LlamaProxy:
         self._http: Optional[aiohttp.ClientSession] = None
         self.semaphore = asyncio.Semaphore(num_slots)
         self.waiting_requests: int = 0
+        self._token_started: dict[int, bool] = {i: False for i in range(num_slots)}
         log.info(f"初始化: {num_slots} 个 slot")
 
     @property
@@ -208,7 +211,7 @@ class LlamaProxy:
             f"驱逐 session {evict_session_id[:8]} (分数: {max_evict_score:.1f})",
         )
 
-    def _bind_session(self, session_id: str, slot_id: int, messages: list):
+    def _bind_session(self, session_id: str, slot_id: int, messages: list, source: str):
         now = time.time()
         msg_count = len(messages)
 
@@ -220,6 +223,7 @@ class LlamaProxy:
         slot.char_count = char_count
         slot.last_used = now
         slot.request_count += 1
+        slot.source = source
 
         if session_id in self.sessions:
             info = self.sessions[session_id]
@@ -256,12 +260,35 @@ class LlamaProxy:
             messages: list = body.get("messages", [])
             stream: bool = body.get("stream", True)
 
+            # 提取请求来源 (使用独立模块识别)
+            source = detect_source(messages, body, dict(request.headers))
+            # 调试：捕获未能精确识别为业务来源的报文，帮助完善识别正则
+            if source in ["OpenAI", "Unknown", "Python", "Python-Req", "AioHttp"]:
+                try:
+                    with open("debug_source.log", "a", encoding="utf-8") as f_debug:
+                        f_debug.write(
+                            f"\n--- [{time.strftime('%H:%M:%S')}] Source={source} ---\n"
+                        )
+                        f_debug.write(f"UA: {request.headers.get('User-Agent')}\n")
+                        f_debug.write(f"Body User: {body.get('user')}\n")
+                        f_debug.write(
+                            f"First Msg: {json.dumps(messages[0] if messages else {}, ensure_ascii=False)}\n"
+                        )
+                        sys_p = next(
+                            (
+                                m.get("content")
+                                for m in messages
+                                if m.get("role") == "system"
+                            ),
+                            "None",
+                        )
+                        f_debug.write(f"Full System Prompt: {sys_p}\n")
+                except:
+                    pass
+
             # 强制启用缓存
             body["cache_prompt"] = True
             session_id = make_session_id(messages)
-
-            # 计算总字符数，用于衡量缓存权重
-            total_chars = sum(len(str(m.get("content", ""))) for m in messages)
 
             async with self.lock:
                 slot_id, reason = self._get_slot_for_session(session_id, messages)
@@ -281,27 +308,39 @@ class LlamaProxy:
 
                 body["id_slot"] = slot_id
 
-                # 提前绑定 session 并更新状态，立即释放锁
-                self._bind_session(session_id, slot_id, messages)
-                self.slot_messages[slot_id] = list(messages)
+                # 提前更新占用状态
+                self._bind_session(session_id, slot_id, messages, source)
                 self.slots[slot_id].processing = True
-                self.slots[slot_id].latest_token = ""
+                self._token_started[slot_id] = False
                 self.slots[slot_id].matched_chars = matched_chars
                 self.slots[slot_id].new_chars = new_chars
 
             try:
-                return await self._forward(request, body, stream, slot_id)
+                response, success = await self._forward(request, body, stream, slot_id)
+                if success:
+                    # 只有完整成功的请求才提交索引
+                    self.slot_messages[slot_id] = list(messages)
+                else:
+                    log.warning(f"Slot {slot_id} 请求未完成，重置索引")
+                    self.slot_messages[slot_id] = []
+                return response
             except (Exception, asyncio.CancelledError) as e:
-                log.info(f"客户端请求中断 ({type(e).__name__})")
+                log.info(f"客户端中断 ({type(e).__name__}) - 索引已清空")
+                self.slot_messages[slot_id] = []
                 raise
             finally:
+                # 核心修复：使用 shield 确保延时不受取消影响，让 monitor 抓到最后一帧
+                try:
+                    await asyncio.shield(asyncio.sleep(0.3))
+                except:
+                    pass
                 self.slots[slot_id].processing = False
         finally:
             self.semaphore.release()
 
     async def _forward(
         self, original_request: web.Request, body: dict, stream: bool, slot_id: int
-    ):
+    ) -> tuple[web.StreamResponse, bool]:
         url = f"{LLAMA_URL}/v1/chat/completions"
         headers = {
             k: v
@@ -337,48 +376,108 @@ class LlamaProxy:
                                     payload = line.split(b":", 1)[1].strip()
                                     j = json.loads(payload.decode("utf-8"))
                                     delta = j.get("choices", [{}])[0].get("delta", {})
-                                    c1 = delta.get("content")
-                                    c2 = delta.get("reasoning_content")
-                                    content = (c1 if c1 is not None else "") + (
-                                        c2 if c2 is not None else ""
+                                    content = (delta.get("content") or "") + (
+                                        delta.get("reasoning_content") or ""
                                     )
                                     if content:
-                                        slot = self.slots[slot_id]
-                                        slot.latest_token = (
-                                            slot.latest_token
+                                        if not self._token_started[slot_id]:
+                                            self.slots[slot_id].latest_token = ""
+                                            self._token_started[slot_id] = True
+                                        self.slots[slot_id].latest_token = (
+                                            self.slots[slot_id].latest_token
                                             + content.replace("\n", " ")
                                         )[-60:]
                                 except Exception:
                                     pass
+
+                    # 处理流结束时的粘包或未换行的末尾数据
+                    last_line = buffer.strip()
+                    if last_line.startswith(b"data:") and b"[DONE]" not in last_line:
+                        try:
+                            payload = last_line.split(b":", 1)[1].strip()
+                            j = json.loads(payload.decode("utf-8"))
+                            delta = j.get("choices", [{}])[0].get("delta", {})
+                            content = (delta.get("content") or "") + (
+                                delta.get("reasoning_content") or ""
+                            )
+                            if content:
+                                if not self._token_started[slot_id]:
+                                    self.slots[slot_id].latest_token = ""
+                                    self._token_started[slot_id] = True
+                                self.slots[slot_id].latest_token = (
+                                    self.slots[slot_id].latest_token
+                                    + content.replace("\n", " ")
+                                )[-60:]
+                        except:
+                            pass
                 await resp.write_eof()
+                return resp, True
             except (Exception, asyncio.CancelledError) as e:
                 # 忽略客户端断开引起的写入异常，正常返回 resp 防止 aiohttp 抛出 500
                 log.info(f"流传输中断 (客户端已断开): {type(e).__name__}")
-            return resp
+                return resp, False
         else:
-            async with self.http.post(
-                url, json=body, headers=headers, timeout=timeout
-            ) as upstream:
-                data = await upstream.read()
-                try:
-                    j = json.loads(data.decode("utf-8"))
-                    msg = j.get("choices", [{}])[0].get("message", {})
-                    c1 = msg.get("content")
-                    c2 = msg.get("reasoning_content")
-                    content = (c1 if c1 is not None else "") + (
-                        c2 if c2 is not None else ""
-                    )
-                    if content:
-                        self.slots[slot_id].latest_token = content.replace("\n", " ")[
-                            -60:
-                        ]
-                except Exception:
-                    pass
+            # 对于非流式请求（如 TitleGen），采用更激进的 JSON 深度搜索策略
+            async def fetch_and_parse():
+                async with self.http.post(
+                    url, json=body, headers=headers, timeout=timeout
+                ) as upstream:
+                    raw_data = await upstream.read()
+                    try:
+                        resp_text = raw_data.decode("utf-8", errors="ignore")
+                        j = json.loads(resp_text)
+
+                        # 广度优先搜索所有可能的文本来源
+                        res = ""
+                        choices = j.get("choices", [])
+                        if choices:
+                            m = choices[0].get("message", {})
+                            res = (
+                                m.get("content")
+                                or m.get("reasoning_content")
+                                or choices[0].get("text")
+                                or ""
+                            )
+                        else:
+                            res = j.get("content") or j.get("text") or ""
+
+                        if not res:
+                            # 暴力搜索 JSON 中任何长于 2 且非元数据的字符串
+                            for key, val in j.items():
+                                if (
+                                    isinstance(val, str)
+                                    and len(val) > 2
+                                    and key not in ["id", "model", "object"]
+                                ):
+                                    res = val
+                                    break
+
+                        if res:
+                            self.slots[slot_id].latest_token = (
+                                str(res)
+                                .replace("\n", " ")
+                                .replace("  ", " ")
+                                .strip()[-60:]
+                            )
+                            self._token_started[slot_id] = True
+                            log.info(
+                                f"Slot {slot_id} 非流式解析成功: {self.slots[slot_id].latest_token}"
+                            )
+                    except Exception as e:
+                        log.error(f"Slot {slot_id} 非流式解析失败: {e}")
+                    return raw_data, upstream.status
+
+            try:
+                # 即使客户端主动断开连接（如 Hermes 获取标题后立即 close），也要通过 shield 把响应读完并解析
+                data, status = await asyncio.shield(fetch_and_parse())
                 return web.Response(
-                    status=upstream.status,
+                    status=status,
                     headers={"Content-Type": "application/json"},
                     body=data,
-                )
+                ), (status == 200)
+            except Exception as e:
+                log.error(f"Slot {slot_id} 转发异常: {e}")
+                return web.Response(status=500), False
 
     async def handle_passthrough(self, request: web.Request) -> web.Response:
         url = f"{LLAMA_URL}{request.path_qs}"
@@ -418,6 +517,7 @@ class LlamaProxy:
                     "latest_token": s.latest_token,
                     "matched_chars": s.matched_chars,
                     "new_chars": s.new_chars,
+                    "source": getattr(s, "source", ""),
                 }
             )
 
