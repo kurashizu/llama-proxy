@@ -65,6 +65,9 @@ class SlotInfo:
     last_used: float = field(default_factory=time.time)
     request_count: int = 0
     processing: bool = False
+    latest_token: str = ""
+    matched_chars: int = 0
+    new_chars: int = 0
 
     def is_idle(self) -> bool:
         return self.session_id is None
@@ -121,6 +124,21 @@ def common_prefix_len(a: list, b: list) -> int:
         if ra != rb:
             return i
     return n
+
+
+def count_chars(messages: list) -> int:
+    total = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total += len(part.get("text", ""))
+        else:
+            total += len(str(content))
+    return total
 
 
 # ─────────────────────────────────────────────
@@ -194,17 +212,7 @@ class LlamaProxy:
         now = time.time()
         msg_count = len(messages)
 
-        char_count = 0
-        for m in messages:
-            content = m.get("content", "")
-            if isinstance(content, str):
-                char_count += len(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        char_count += len(part.get("text", ""))
-            else:
-                char_count += len(str(content))
+        char_count = count_chars(messages)
 
         slot = self.slots[slot_id]
         slot.session_id = session_id
@@ -258,23 +266,31 @@ class LlamaProxy:
             async with self.lock:
                 slot_id, reason = self._get_slot_for_session(session_id, messages)
 
+                # 分析缓存复用情况
                 cached_msgs = self.slot_messages.get(slot_id, [])
                 prefix_len = common_prefix_len(messages, cached_msgs)
 
+                matched_chars = count_chars(messages[:prefix_len])
+                total_chars = count_chars(messages)
+                new_chars = total_chars - matched_chars
+
                 log.info(
                     f"session={session_id[:8]} → slot={slot_id} | {reason} | "
-                    f"msgs={len(messages)} chars={total_chars} 匹配={prefix_len}"
+                    f"msgs={len(messages)} 匹配={prefix_len} 新增字符={new_chars}"
                 )
 
                 body["id_slot"] = slot_id
 
-                # 提前绑定 session 并更新状态，立即释放锁，防止流式传输过程长时间阻塞其他并发请求
+                # 提前绑定 session 并更新状态，立即释放锁
                 self._bind_session(session_id, slot_id, messages)
                 self.slot_messages[slot_id] = list(messages)
                 self.slots[slot_id].processing = True
+                self.slots[slot_id].latest_token = ""
+                self.slots[slot_id].matched_chars = matched_chars
+                self.slots[slot_id].new_chars = new_chars
 
             try:
-                return await self._forward(request, body, stream)
+                return await self._forward(request, body, stream, slot_id)
             except (Exception, asyncio.CancelledError) as e:
                 log.info(f"客户端请求中断 ({type(e).__name__})")
                 raise
@@ -283,7 +299,9 @@ class LlamaProxy:
         finally:
             self.semaphore.release()
 
-    async def _forward(self, original_request: web.Request, body: dict, stream: bool):
+    async def _forward(
+        self, original_request: web.Request, body: dict, stream: bool, slot_id: int
+    ):
         url = f"{LLAMA_URL}/v1/chat/completions"
         headers = {
             k: v
@@ -307,8 +325,31 @@ class LlamaProxy:
                 async with self.http.post(
                     url, json=body, headers=headers, timeout=timeout
                 ) as upstream:
+                    buffer = b""
                     async for chunk in upstream.content.iter_any():
                         await resp.write(chunk)
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            line = line.strip()
+                            if line.startswith(b"data:") and b"[DONE]" not in line:
+                                try:
+                                    payload = line.split(b":", 1)[1].strip()
+                                    j = json.loads(payload.decode("utf-8"))
+                                    delta = j.get("choices", [{}])[0].get("delta", {})
+                                    c1 = delta.get("content")
+                                    c2 = delta.get("reasoning_content")
+                                    content = (c1 if c1 is not None else "") + (
+                                        c2 if c2 is not None else ""
+                                    )
+                                    if content:
+                                        slot = self.slots[slot_id]
+                                        slot.latest_token = (
+                                            slot.latest_token
+                                            + content.replace("\n", " ")
+                                        )[-60:]
+                                except Exception:
+                                    pass
                 await resp.write_eof()
             except (Exception, asyncio.CancelledError) as e:
                 # 忽略客户端断开引起的写入异常，正常返回 resp 防止 aiohttp 抛出 500
@@ -319,6 +360,20 @@ class LlamaProxy:
                 url, json=body, headers=headers, timeout=timeout
             ) as upstream:
                 data = await upstream.read()
+                try:
+                    j = json.loads(data.decode("utf-8"))
+                    msg = j.get("choices", [{}])[0].get("message", {})
+                    c1 = msg.get("content")
+                    c2 = msg.get("reasoning_content")
+                    content = (c1 if c1 is not None else "") + (
+                        c2 if c2 is not None else ""
+                    )
+                    if content:
+                        self.slots[slot_id].latest_token = content.replace("\n", " ")[
+                            -60:
+                        ]
+                except Exception:
+                    pass
                 return web.Response(
                     status=upstream.status,
                     headers={"Content-Type": "application/json"},
@@ -360,6 +415,9 @@ class LlamaProxy:
                     "requests": s.request_count,
                     "processing": s.processing,
                     "evict_score": round(score, 2),
+                    "latest_token": s.latest_token,
+                    "matched_chars": s.matched_chars,
+                    "new_chars": s.new_chars,
                 }
             )
 
@@ -400,7 +458,9 @@ def main():
     log.info(
         f"代理启动: {args.proxy_host}:{args.proxy_port} → {args.llama_url}  slots={args.slots}"
     )
-    web.run_app(app, host=args.proxy_host, port=args.proxy_port, print=None)
+    web.run_app(
+        app, host=args.proxy_host, port=args.proxy_port, print=None, access_log=None
+    )
 
 
 if __name__ == "__main__":

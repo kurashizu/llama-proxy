@@ -26,11 +26,15 @@ LLAMA_URL = f"{LLAMA_BASE_URL}/slots"
 SSH_HOST = config.get("llama_server", {}).get("ssh_host", "krsz@10.0.0.20")
 LLAMA_LOG_PATH = config.get("llama_server", {}).get("log_path", "/tmp/llama.log")
 
+from collections import deque
+
 # 全局状态字典与锁
 state_lock = threading.Lock()
 proxy_data = {}
 llama_data = {}
 prefill_progress = {}
+last_task_ids = {}  # 记录每个 slot 上一次的任务 ID，用于检测任务切换
+proxy_logs = deque(maxlen=8)
 
 
 def fetch_proxy():
@@ -44,6 +48,27 @@ def fetch_proxy():
         except Exception:
             pass
         time.sleep(0.5)
+
+
+def tail_proxy_log():
+    """后台实时获取 proxy.log 的最新几行"""
+    global proxy_logs
+    cmd = ["tail", "-n", "0", "-F", "proxy.log"]
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        for line in iter(p.stdout.readline, ""):
+            if not line:
+                break
+            with state_lock:
+                proxy_logs.append(line.strip())
+    except Exception:
+        pass
 
 
 def fetch_llama():
@@ -106,35 +131,62 @@ def tail_llama_log():
 
 
 def generate_layout():
+    global last_task_ids
     with state_lock:
         p_data = dict(proxy_data)
         l_data = dict(llama_data)
         prog_data = dict(prefill_progress)
+        logs = list(proxy_logs)
 
     layout = Layout()
-    layout.split_column(Layout(name="header", size=3), Layout(name="main"))
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main"),
+        Layout(name="footer", size=10),
+    )
 
     # 1. 标题区
+    proxy_online = bool(p_data)
+    proxy_status = (
+        "[bold green]ONLINE[/bold green]"
+        if proxy_online
+        else "[bold red]OFFLINE[/bold red]"
+    )
     num_slots = p_data.get("num_slots", "?")
-    header_text = Text(
-        f"Llama Proxy Monitor | Slots: {num_slots}", justify="center", style="bold cyan"
+
+    header_text = Text.from_markup(
+        f"[bold cyan]Llama Proxy Monitor[/bold cyan] | Status: {proxy_status} | [bold cyan]Slots: {num_slots}[/bold cyan]",
+        justify="center",
     )
     layout["header"].update(Panel(header_text))
 
-    # 2. 表格区 (自适应列宽，避免拥挤)
+    # 2. 槽位状态表格区
     table = Table(expand=True, show_header=True, header_style="bold magenta")
     table.add_column("Slot ID", justify="center", ratio=1)
-    table.add_column("State", justify="center", ratio=4)
-    table.add_column("Session ID", justify="center", ratio=1)
+    table.add_column("State", justify="center", ratio=3)
+    table.add_column("Session ID", justify="center", ratio=2)
     table.add_column("Msgs", justify="center", ratio=1)
     table.add_column("Total Chars", justify="center", ratio=2)
     table.add_column("Evict Score", justify="center", ratio=2)
     table.add_column("Progress / Status", justify="center", ratio=4)
 
+    # Live Token 独立表格
+    token_table = Table(expand=True, show_header=True, header_style="bold blue")
+    token_table.add_column("Slot", justify="center", ratio=1)
+    token_table.add_column("Live Generated Tokens", justify="left", ratio=9)
+
     slots = p_data.get("slots", [])
     for slot in slots:
         s_id = slot["slot_id"]
         is_processing = slot.get("processing", False)
+
+        # 任务切换检测：如果 llama-server 的任务 ID 变了，立刻重置该槽位的本地进度缓存
+        l_slot = l_data.get(s_id, {})
+        current_task_id = l_slot.get("id_task", -1)
+        if last_task_ids.get(s_id) != current_task_id:
+            with state_lock:
+                prefill_progress.pop(s_id, None)
+            last_task_ids[s_id] = current_task_id
 
         if is_processing:
             state = "[bold red]Processing (Busy)[/bold red]"
@@ -161,42 +213,72 @@ def generate_layout():
             if "next_token" in l_slot and len(l_slot["next_token"]) > 0:
                 n_decoded = l_slot["next_token"][0].get("n_decoded", 0)
 
-            # n_decoded > 0 意味着 Prefill 已结束，正在吐字
+            # 状态机：优先判断是否已开始吐字
             if n_decoded > 0:
                 op_status = f"[bold cyan]Generating (Tokens: {n_decoded})[/bold cyan]"
             else:
-                # 否则正在进行耗时的 Prefill，显示读取日志得到的进度
+                # 只有 n_decoded 为 0 时才显示 Prefill 进度
                 prog = prog_data.get(s_id, -1.0)
                 if prog >= 0:
                     op_status = f"[bold yellow]Prefill: {prog * 100:.1f}%[/bold yellow]"
                 else:
                     op_status = "[bold yellow]Prefill...[/bold yellow]"
 
+        # 显示匹配字符数 (+ 本次新增字符数)
+        total_chars = slot.get("char_count", 0)
+        new_chars = slot.get("new_chars", 0)
+        if is_processing and new_chars > 0:
+            matched = total_chars - new_chars
+            char_display = f"{matched} [bold yellow](+{new_chars})[/bold yellow]"
+        else:
+            char_display = str(total_chars)
+
         table.add_row(
             str(s_id),
             state,
             session,
             str(slot.get("msg_count", 0)),
-            str(slot.get("char_count", 0)),
+            char_display,
             evict_score,
             op_status,
         )
 
-    # 3. 队列区
+        latest_token = slot.get("latest_token", "")
+        if session != "[dim]None[/dim]":
+            if latest_token:
+                token_display = f"[dim]...[/dim][green]{latest_token}[/green]"
+            else:
+                token_display = "[italic dim]waiting for tokens...[/italic dim]"
+            token_table.add_row(f"[bold cyan]Slot {s_id}[/bold cyan]", token_display)
+
     waiting = p_data.get("waiting_requests", 0)
     queue_style = "bold yellow" if waiting > 0 else "dim"
-    queue_text = Text(
-        f"Waiting Requests in Queue: {waiting}", style=queue_style, justify="center"
-    )
-    queue_panel = Panel(queue_text, title="Queue")
+    queue_text = Text(f"Queue Waitlist: {waiting}", style=queue_style, justify="center")
 
-    # 组合布局
+    log_text = Text()
+    for log_entry in logs:
+        if "GET /proxy/status" in log_entry:
+            continue
+        if "[ERROR]" in log_entry:
+            log_text.append(log_entry + "\n", style="bold red")
+        elif "[WARNING]" in log_entry:
+            log_text.append(log_entry + "\n", style="yellow")
+        else:
+            log_text.append(log_entry + "\n", style="dim white")
+
     main_layout = Layout()
     main_layout.split_column(
-        Layout(Panel(table, title="Slot Occupancy & Performance"), ratio=2),
-        Layout(queue_panel, size=3),
+        Layout(Panel(table, title="Slot Resource Allocation"), ratio=3),
+        Layout(Panel(token_table, title="Real-time Token Streams"), ratio=2),
     )
     layout["main"].update(main_layout)
+
+    footer_layout = Layout()
+    footer_layout.split_row(
+        Layout(Panel(queue_text, title="Queue"), ratio=1),
+        Layout(Panel(log_text, title="Recent Proxy Events"), ratio=3),
+    )
+    layout["footer"].update(footer_layout)
     return layout
 
 
@@ -205,6 +287,7 @@ def main():
     threading.Thread(target=fetch_proxy, daemon=True).start()
     threading.Thread(target=fetch_llama, daemon=True).start()
     threading.Thread(target=tail_llama_log, daemon=True).start()
+    threading.Thread(target=tail_proxy_log, daemon=True).start()
 
     # 等待初始数据加载
     time.sleep(1)

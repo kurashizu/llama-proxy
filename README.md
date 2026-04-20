@@ -35,7 +35,7 @@ llama_server:
 
 ### llama-server 启动要求
 为了使代理正常工作并能让 Monitor 捕获预填充进度，**你必须在启动 `llama-server` 时满足以下两个条件：**
-1. **添加 `-lv 3` 或 `-lv 4` 参数**：开启详细日志，以便打印出底层的进度信息。
+1. **添加 `-lv 4` 参数**：开启详细日志，以便打印出底层的进度信息。
 2. **重定向标准输出到日志文件**：必须将输出写入 `config.yaml` 中配置的 `log_path`。
 例如（推荐使用 nohup 后台运行）：
 ```bash
@@ -61,13 +61,3 @@ nohup ./llama-server -m your_model.gguf ... -lv 4 > /tmp/llama.log 2>&1 &
 这会呼出一个极具科技感的全屏 UI 面板。
 
 ---
-
-## 关于 Monitor 看板的玄机
-
-你会发现 Monitor 甚至能够实时显示当前正在算到百分之多少（`Prefill: 89.2%`）。
-因为 `llama-server` 官方的 HTTP `/slots` 接口**并不包含**任何关于预填充进度的信息。
-
-**它是怎么做到的？**
-1. `monitor.py` 在后台起了一个子线程，建立了一条 SSH 长连接：`ssh krsz@10.0.0.20 tail -n 0 -F /tmp/llama.log`。
-2. 远端的模型计算引擎只要一输出 `prompt processing progress` 这一行日志，就会顺着 SSH 管道瞬间流进本地的内存中。
-3. `monitor.py` 用正则对流进来的纯文本进行零延迟拦截，提取出数字，然后与 HTTP `/slots` 获取到的状态、`proxy.py` 提供的数据进行 3 端数据融合，最终渲染在你的屏幕上。
