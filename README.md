@@ -1,6 +1,6 @@
 # Llama Proxy 🚀
 
-[English](#english) | [中文](#chinese)
+[English](#English) | [中文](#中文)
 
 ---
 
