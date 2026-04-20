@@ -4,7 +4,7 @@
 
 ---
 
-## English 🇺🇸
+## English
 
 ### Overview ✨
 This proxy routes OpenAI-compatible chat completion requests to a llama.cpp-based server (llama-server). It implements session affinity (session → slot) so a stable session ID is bound to a fixed slot and per-slot KV cache can be reused to minimize recomputation. The proxy adds a cost-aware eviction policy and includes a monitor that tails remote logs to display Prefill/progress in near real-time.
@@ -129,7 +129,7 @@ sequenceDiagram
 
 ---
 
-## 中文 🇨🇳
+## 中文
 
 ### 概要 ✨
 本代理将 OpenAI 兼容的 chat completion 请求路由到基于 llama.cpp 的服务端（llama-server），并实现会话亲和（session → slot）：将稳定的会话 ID 绑定到固定槽位，以复用每个槽位的 KV 缓存并减少重算。代理包含成本感知驱逐策略，并通过监控（SSH tail）读取远端日志以接近实时显示 Prefill/进度。
