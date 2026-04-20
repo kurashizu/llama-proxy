@@ -1,3 +1,4 @@
+.hermes/llama-proxy/source_detector.py#L1-200
 import json
 import re
 from typing import Dict, List, Optional
@@ -6,10 +7,10 @@ from typing import Dict, List, Optional
 class SourceDetector:
     """
     Hermes Llama Proxy - Source Detection Engine (Strict Version)
-    采用高精度指纹特征组匹配，确保来源识别的准确性。
+    High-precision fingerprint/group matching for reliable source detection.
     """
 
-    # 精准匹配规则定义 (基于 System Prompt 中的排他性指令段落)
+    # Precise matching rules (based on exclusive instruction blocks commonly found in System Prompts)
     PATTERNS = {
         "CLI": [
             r"You are a CLI AI Agent",
@@ -36,7 +37,13 @@ class SourceDetector:
 
     @staticmethod
     def _extract_text(content) -> str:
-        """从各种格式的消息内容中提取纯文本"""
+        """
+        Extract plain text from various message content formats.
+
+        - If content is a string, return it directly.
+        - If content is a list (multimodal), join 'text' parts from dict elements.
+        - Otherwise, coerce to string.
+        """
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -50,13 +57,16 @@ class SourceDetector:
     @classmethod
     def detect(cls, messages: List[Dict], body: Dict, headers: Dict) -> str:
         """
-        高精度识别逻辑：
-        1. 针对 System Prompt 执行特征组严格匹配
-        2. 针对 Body 执行 OpenAI 标准字段匹配
-        3. 针对 User-Agent 执行客户端指纹匹配
+        High-precision detection logic:
+        1. Perform fingerprint matching against the System Prompt and nearby messages.
+        2. Inspect top-level JSON 'user' field in the body (many WebUIs or custom agents set it).
+        3. Use the User-Agent header for client fingerprinting.
+
+        Returns a short identifier like "Discord", "CLI", "TitleGen", "Postman", "Python-Req", etc.
+        Falls back to "Unknown" if no reliable match is found.
         """
 
-        # --- 1. System Prompt 深度指纹扫描 ---
+        # --- 1. Deep scan the System Prompt and the first few messages ---
         system_msg = next(
             (
                 cls._extract_text(m.get("content", ""))
@@ -66,7 +76,7 @@ class SourceDetector:
             "",
         )
 
-        # 扫描 System Prompt 以及前几条消息 (针对 TitleGen 指令可能出现在 User 消息中的情况)
+        # Collect candidate texts to scan (system prompt + up to first 3 messages).
         search_texts = [system_msg] if system_msg else []
         if len(messages) <= 3:
             for m in messages:
@@ -75,37 +85,37 @@ class SourceDetector:
                     search_texts.append(content)
 
         for text in search_texts:
-            # 1.1 尝试匹配 Discord 专用格式
+            # 1.1 Try Discord-specific patterns
             for p in cls.PATTERNS["Discord"]:
                 if re.search(p, text):
                     return "Discord"
 
-            # 1.2 尝试匹配 CLI 专用指令
+            # 1.2 Try CLI-specific patterns
             for p in cls.PATTERNS["CLI"]:
                 if re.search(p, text):
                     return "CLI"
 
-            # 1.3 尝试匹配 标题生成 任务
+            # 1.3 Try Title generation task patterns
             for p in cls.PATTERNS["TitleGen"]:
                 if re.search(p, text):
                     return "TitleGen"
 
-            # 1.4 通用 platform 注入正则 (匹配完整 tag)
+            # 1.4 Generic platform injection regex (match a full tag like `platform: NAME`)
             m_plt = re.search(
                 r"\bplatform:\s*([A-Za-z0-9_]+)\b", system_msg, re.IGNORECASE
             )
             if m_plt:
                 return m_plt.group(1).upper()
 
-        # --- 2. JSON Body 显式字段检测 ---
-        # 很多 WebUI 或自定义 Agent 会在 JSON 顶层传 user 字段
+        # --- 2. Explicit JSON body field detection ---
+        # Many WebUIs or custom agents include a top-level "user" field in the JSON body.
         body_user = body.get("user", "")
         if body_user and isinstance(body_user, str):
-            # 过滤掉默认的 generic 占位符
+            # Filter out common generic placeholders
             if body_user.lower() not in ["user", "default", "none"]:
                 return body_user
 
-        # --- 3. User-Agent 客户端指纹识别 ---
+        # --- 3. User-Agent client fingerprinting ---
         ua = headers.get("User-Agent", "")
         if ua:
             ua_lower = ua.lower()
@@ -122,15 +132,16 @@ class SourceDetector:
             if "postman" in ua_lower:
                 return "Postman"
 
-            # 保底：取 UA 第一个有意义的部分
+            # Fallback: return the first meaningful User-Agent token if it's reasonably short
             ua_parts = ua.split("/")
             if ua_parts:
                 clean_ua = ua_parts[0].strip()
-                if len(clean_ua) < 15:  # 防止长字符串刷屏
+                # Avoid returning overly long strings as the source identifier
+                if len(clean_ua) < 15:
                     return clean_ua
 
         return "Unknown"
 
 
-# 导出函数
+# Exported helper
 detect_source = SourceDetector.detect

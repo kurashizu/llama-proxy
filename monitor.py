@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import re
 import subprocess
@@ -13,11 +14,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# ─────────────────────────────────────────────
-# 配置加载
-# ─────────────────────────────────────────────
+# --------------------------------------------------
+# Configuration loading
+# --------------------------------------------------
+# The project resides in the llama-proxy folder; use a relative path to locate config
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 try:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -26,7 +29,7 @@ except Exception:
 
 PROXY_HOST = config.get("proxy", {}).get("host", "127.0.0.1")
 PROXY_PORT = config.get("proxy", {}).get("port", 8888)
-# 如果监听 0.0.0.0，则本地连接 127.0.0.1
+# If proxy listens on 0.0.0.0, use 127.0.0.1 for local queries
 PROXY_URL = f"http://{'127.0.0.1' if PROXY_HOST == '0.0.0.0' else PROXY_HOST}:{PROXY_PORT}/proxy/status"
 
 LLAMA_BASE_URL = config.get("llama_server", {}).get("url", "http://10.0.0.20:11400")
@@ -36,9 +39,9 @@ SSH_HOST = config.get("llama_server", {}).get("ssh_host", "krsz@10.0.0.20")
 LLAMA_LOG_PATH = config.get("llama_server", {}).get("log_path", "/tmp/llama.log")
 
 
-# ─────────────────────────────────────────────
-# 全局数据与工具
-# ─────────────────────────────────────────────
+# --------------------------------------------------
+# Global data and utilities
+# --------------------------------------------------
 
 state_lock = threading.Lock()
 proxy_data = {}
@@ -49,7 +52,7 @@ proxy_logs = deque(maxlen=8)
 
 
 def human_format(num):
-    """格式化大数字为 k, M, G 等单位，始终显示为整数部分"""
+    """Format large numbers into k, M, G units, showing integer-style output."""
     if num is None:
         return "0"
     try:
@@ -65,17 +68,17 @@ def human_format(num):
     if magnitude == 0:
         return str(int(num))
 
-    # 按照用户要求，单位化后也尽量保持简洁（取整或1位小数）
     val = f"{num:.1f}".rstrip("0").rstrip(".")
     return f"{val}{['', 'k', 'M', 'G', 'T'][magnitude]}"
 
 
-# ─────────────────────────────────────────────
-# 后台数据采集线程
-# ─────────────────────────────────────────────
+# --------------------------------------------------
+# Background data collection threads
+# --------------------------------------------------
 
 
 def fetch_proxy():
+    """Periodically fetch /proxy/status from the local proxy for UI data."""
     global proxy_data
     while True:
         try:
@@ -89,8 +92,11 @@ def fetch_proxy():
 
 
 def tail_proxy_log():
+    """Tail the local proxy.log file and keep recent events for display."""
     global proxy_logs
-    cmd = ["tail", "-n", "0", "-F", "proxy.log"]
+    # Log file path relative to the project directory
+    log_file = os.path.join(BASE_DIR, "proxy.log")
+    cmd = ["tail", "-n", "0", "-F", log_file]
     try:
         p = subprocess.Popen(
             cmd,
@@ -102,7 +108,6 @@ def tail_proxy_log():
         for line in iter(p.stdout.readline, ""):
             if not line:
                 break
-            # 过滤掉高频的心跳检查日志
             if "/proxy/status" in line:
                 continue
             with state_lock:
@@ -112,11 +117,13 @@ def tail_proxy_log():
 
 
 def fetch_llama():
+    """Periodically query the llama-server /slots endpoint to enrich the UI."""
     global llama_data
     while True:
         try:
             data = requests.get(LLAMA_URL, timeout=1).json()
             with state_lock:
+                # convert list to dict keyed by slot id for fast lookup
                 llama_data = {slot["id"]: slot for slot in data}
         except Exception:
             pass
@@ -124,6 +131,12 @@ def fetch_llama():
 
 
 def tail_llama_log():
+    """
+    SSH-tail the remote llama-server log and extract Prefill/progress lines.
+
+    Expected log lines contain phrases like "prompt processing progress" and "prompt processing done".
+    The monitor extracts the slot id and progress value and stores them in prefill_progress.
+    """
     global prefill_progress
     while True:
         cmd = ["ssh", SSH_HOST, f"tail -n 0 -F {LLAMA_LOG_PATH}"]
@@ -162,12 +175,13 @@ def tail_llama_log():
         time.sleep(2)
 
 
-# ─────────────────────────────────────────────
-# UI 布局与渲染
-# ─────────────────────────────────────────────
+# --------------------------------------------------
+# UI layout and rendering
+# --------------------------------------------------
 
 
 def generate_layout():
+    """Construct the Rich layout used for live monitoring."""
     global last_task_ids
     with state_lock:
         p_data = dict(proxy_data)
@@ -182,7 +196,7 @@ def generate_layout():
         Layout(name="footer", size=10),
     )
 
-    # 1. 标题区 (显示 Proxy 是否在线)
+    # 1. Header area
     proxy_online = bool(p_data)
     proxy_status = (
         "[bold green]ONLINE[/bold green]"
@@ -196,8 +210,10 @@ def generate_layout():
     )
     layout["header"].update(Panel(header_text))
 
-    # 2. 槽位状态表格 (资源分配)
-    res_table = Table(expand=True, show_header=True, header_style="bold magenta")
+    # 2. Slot resource allocation table (with row separators)
+    res_table = Table(
+        expand=True, show_header=True, header_style="bold magenta", show_lines=True
+    )
     res_table.add_column("Slot", justify="center", ratio=1)
     res_table.add_column("State", justify="center", ratio=3)
     res_table.add_column("Msgs", justify="center", ratio=1)
@@ -205,19 +221,30 @@ def generate_layout():
     res_table.add_column("Evict Score", justify="center", ratio=2)
     res_table.add_column("Progress / Status", justify="center", ratio=5)
 
-    # 3. 实时字流表格 (包含 SessionID 和 Source)
-    token_table = Table(expand=True, show_header=True, header_style="bold blue")
+    # 3. Real-time token stream table (includes SessionID and Source)
+    token_table = Table(
+        expand=True, show_header=True, header_style="bold blue", show_lines=True
+    )
     token_table.add_column("Slot", justify="center", ratio=1)
     token_table.add_column("Session", justify="center", ratio=2)
     token_table.add_column("Source", justify="center", ratio=2)
     token_table.add_column("Live Generated Tokens", justify="left", ratio=10)
 
     slots = p_data.get("slots", [])
+
+    # Precompute the highest evict score among non-processing slots for styling
+    max_score = -1.0
+    for slot in slots:
+        if not slot.get("processing") and slot.get("session_id"):
+            score = slot.get("evict_score", 0)
+            if score > max_score:
+                max_score = score
+
     for slot in slots:
         s_id = slot["slot_id"]
         is_processing = slot.get("processing", False)
 
-        # 任务切换检测与进度清理
+        # Task switch detection and progress cleanup
         l_slot = l_data.get(s_id, {})
         current_task_id = l_slot.get("id_task", -1)
         if last_task_ids.get(s_id) != current_task_id:
@@ -225,7 +252,7 @@ def generate_layout():
                 prefill_progress.pop(s_id, None)
             last_task_ids[s_id] = current_task_id
 
-        # 状态文案
+        # State text
         if is_processing:
             state = "[bold red]Processing[/bold red]"
         elif slot.get("session_id"):
@@ -233,12 +260,19 @@ def generate_layout():
         else:
             state = "[dim]Empty[/dim]"
 
-        # 被踢分数 (整数显示)
-        evict_score = str(int(slot.get("evict_score", 0)))
+        # Evict score display logic
+        raw_score = slot.get("evict_score", 0)
+        score_val = int(raw_score)
         if is_processing or not slot.get("session_id"):
-            evict_score = "[dim]-[/dim]"
+            evict_score = Text("-", style="dim")
+        else:
+            # Highlight highest score in red
+            style = (
+                "bold red" if (max_score > 0 and raw_score >= max_score) else "white"
+            )
+            evict_score = Text(str(score_val), style=style)
 
-        # 详细运行状态 (Prefill / Generating)
+        # Detailed running status (Prefill / Generating)
         op_status = "[dim]-[/dim]"
         n_decoded = 0
         latest_token = slot.get("latest_token", "")
@@ -248,16 +282,12 @@ def generate_layout():
             if "next_token" in l_slot and len(l_slot["next_token"]) > 0:
                 n_decoded = l_slot["next_token"][0].get("n_decoded", 0)
 
-            # 状态机优先级重构：
-            # 1. 只要代理抓到了字，且 llama-server 确认了生成，就是 Generating
             if latest_token and n_decoded > 0:
                 op_status = (
                     f"[bold cyan]Generating ({human_format(n_decoded)} T)[/bold cyan]"
                 )
-            # 2. 如果是 TitleGen 且正在处理，直接显示任务属性（因为通常极快）
             elif source == "TitleGen":
                 op_status = "[bold green]Generating Title...[/bold green]"
-            # 3. 检查 Prefill 日志进度
             else:
                 prog = prog_data.get(s_id, -1.0)
                 if prog >= 0:
@@ -265,12 +295,11 @@ def generate_layout():
                 elif (
                     slot.get("matched_chars", 0) > 0 and slot.get("new_chars", 0) < 1500
                 ):
-                    # 高度疑似缓存命中
                     op_status = "[bold green]Fast Cache Hit[/bold green]"
                 else:
                     op_status = "[bold yellow]Prefill...[/bold yellow]"
 
-        # 字符统计 (显示命中+新增)
+        # Character statistics (show matched + new when processing)
         total_chars = slot.get("char_count", 0)
         new_chars = slot.get("new_chars", 0)
         if is_processing and new_chars > 0:
@@ -288,10 +317,9 @@ def generate_layout():
             op_status,
         )
 
-        # 填充 Token 流表格
+        # Fill token stream table
         session_id = slot.get("session_id")
         if session_id:
-            # 针对 TitleGen 优化：即便还在 processing 且文字没出来，也给个更积极的提示
             if not latest_token and is_processing:
                 if source == "TitleGen":
                     token_display = (
@@ -305,20 +333,19 @@ def generate_layout():
                 token_display = "[dim]-[/dim]"
 
             token_table.add_row(
-                f"[bold cyan]Slot {s_id}[/bold cyan]",
+                f"{s_id}",
                 session_id[:8],
                 source[:15],
                 token_display,
             )
 
-    # 4. 底部排队与日志
+    # 4. Footer: queue status and recent logs
     waiting = p_data.get("waiting_requests", 0)
     queue_style = "bold yellow" if waiting > 0 else "dim"
     queue_text = Text(f"Waitlist: {waiting}", style=queue_style, justify="center")
 
     log_text = Text()
     for log_entry in logs:
-        # 去除日志中的时间戳前缀以便节省空间
         cleaned_log = re.sub(r"^\d{2}:\d{2}:\d{2} ", "", log_entry)
         if "[ERROR]" in cleaned_log:
             log_text.append(cleaned_log + "\n", style="bold red")
@@ -344,7 +371,7 @@ def generate_layout():
 
 
 def main():
-    # 启动异步线程
+    # Start background threads for fetching proxy and llama data and for tailing logs
     threading.Thread(target=fetch_proxy, daemon=True).start()
     threading.Thread(target=fetch_llama, daemon=True).start()
     threading.Thread(target=tail_llama_log, daemon=True).start()

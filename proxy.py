@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-llama-proxy: session → slot 路由代理
+llama-proxy: session → slot routing proxy
 
-配合以下 llama-server 参数使用:
-  --parallel 3          # slot 数量，按需调整
-  --kv-unified          # 统一 KV 池，slot 间共享 system prompt
-  --cache-ram 0         # 禁用内存级别缓存（防止 clear_idle 静默清空 GPU KV）
-  --ctx-size 65536      # 总 KV 池大小
+This proxy works with llama-server (llama.cpp server) and expects the server to be started
+with the following recommended flags for correct behavior and reliable Prefill monitoring:
 
-原理:
-  - 每个 session_id 绑定到一个固定 slot
-  - 同一 session 的请求始终发到同一 slot，KV cache 持续累积
-  - 使用完整的前 3 条消息作为 Session ID，确保前缀匹配的稳定性
-  - Cost-Aware 驱逐策略：综合考虑闲置时间与重算成本（长对话更难被驱逐）
+  --parallel 3          # number of slots, adjust as needed
+  --kv-unified          # unified KV pool so system prompt is shared across slots
+  --cache-ram 0         # disable memory-level cache (prevents clear_idle from silently clearing GPU KV)
+  --ctx-size 65536      # total KV pool size
+
+Design:
+  - Each session_id is bound to a fixed slot.
+  - Requests for the same session always go to the same slot so KV cache accumulates.
+  - Session ID is computed from the full text of the first 3 messages to ensure stable prefix matching.
+  - Cost-aware eviction: take idle time and recompute cost (character count) into account so long/expensive
+    conversations are less likely to be evicted.
 """
 
 import argparse
@@ -39,10 +42,11 @@ logging.basicConfig(
 log = logging.getLogger("llama-proxy")
 
 # ─────────────────────────────────────────────
-# 全局配置
+# Global configuration
 # ─────────────────────────────────────────────
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     _config = yaml.safe_load(f)
 
@@ -53,7 +57,7 @@ LLAMA_URL = _config.get("llama_server", {}).get("url", "http://10.0.0.20:11400")
 
 
 # ─────────────────────────────────────────────
-# 数据结构
+# Data structures
 # ─────────────────────────────────────────────
 
 
@@ -87,14 +91,16 @@ class SessionInfo:
 
 
 # ─────────────────────────────────────────────
-# 工具函数
+# Utility functions
 # ─────────────────────────────────────────────
 
 
 def make_session_id(messages: list) -> str:
     """
-    根据消息内容生成稳定的 session ID。
-    提取前 3 条消息的完整纯文本内容做哈希，避免因截断导致的缓存冲突。
+    Generate a stable session ID based on message content.
+
+    We extract the full plain-text content of the first 3 messages and hash that,
+    avoiding collisions caused by naive truncation.
     """
     extracted = []
     for m in messages[:3]:
@@ -105,7 +111,7 @@ def make_session_id(messages: list) -> str:
         if isinstance(content, str):
             text_content = content
         elif isinstance(content, list):
-            # 处理多模态结构，仅提取文本
+            # Handle multimodal structures: extract only text parts
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     text_content += part.get("text", "")
@@ -144,7 +150,7 @@ def count_chars(messages: list) -> int:
 
 
 # ─────────────────────────────────────────────
-# 代理核心
+# Proxy core
 # ─────────────────────────────────────────────
 
 
@@ -161,7 +167,7 @@ class LlamaProxy:
         self.semaphore = asyncio.Semaphore(num_slots)
         self.waiting_requests: int = 0
         self._token_started: dict[int, bool] = {i: False for i in range(num_slots)}
-        log.info(f"初始化: {num_slots} 个 slot")
+        log.info(f"Initialized: {num_slots} slots")
 
     @property
     def http(self) -> aiohttp.ClientSession:
@@ -172,21 +178,21 @@ class LlamaProxy:
         return self._http
 
     def _get_slot_for_session(self, session_id: str, messages: list) -> tuple[int, str]:
-        # 1. 已有绑定
+        # 1. Existing binding
         if session_id in self.sessions:
             slot_id = self.sessions[session_id].slot_id
             self.sessions.move_to_end(session_id)
-            return slot_id, "复用已有 slot"
+            return slot_id, "reusing existing slot"
 
-        # 2. 有空闲 slot
+        # 2. Idle slot available
         for slot in self.slots.values():
             if slot.is_idle():
-                return slot.slot_id, "分配空闲 slot"
+                return slot.slot_id, "assigning idle slot"
 
-        # 3. Cost-Aware (成本感知) 驱逐
+        # 3. Cost-Aware eviction
         if not self.sessions:
-            # 防止状态不一致时（如之前请求失败导致 sessions 为空但 slots 仍被标记占用）崩溃
-            return 0, "强制复用 slot 0 (状态异常恢复)"
+            # Prevent crashes in cases where sessions is empty but slots are still marked occupied
+            return 0, "force reuse slot 0 (error recovery)"
 
         now = time.time()
         best_evict_session_id = None
@@ -194,8 +200,8 @@ class LlamaProxy:
 
         for sid, sinfo in self.sessions.items():
             idle_time = now - sinfo.last_used
-            # 驱逐得分 = (闲置时间(秒) * 1000) / (总字符数 + 1000)
-            # 字符越多（重算成本越高），分母越大，得分越低，越不容易被踢掉
+            # Eviction score = (idle_time_seconds * 1000) / (char_count + 1000)
+            # Larger char_count -> larger denominator -> lower score -> less likely to be evicted
             score = (idle_time * 1000) / (sinfo.char_count + 1000)
             if score > max_evict_score:
                 max_evict_score = score
@@ -205,10 +211,12 @@ class LlamaProxy:
         evict_slot_id = self.sessions[evict_session_id].slot_id
 
         del self.sessions[evict_session_id]
-        self.slots[evict_slot_id].session_id = None  # 防止后续 forward 失败导致状态遗留
+        self.slots[
+            evict_slot_id
+        ].session_id = None  # prevent leftover state if forward fails later
         return (
             evict_slot_id,
-            f"驱逐 session {evict_session_id[:8]} (分数: {max_evict_score:.1f})",
+            f"evicting session {evict_session_id[:8]} (score: {max_evict_score:.1f})",
         )
 
     def _bind_session(self, session_id: str, slot_id: int, messages: list, source: str):
@@ -260,12 +268,13 @@ class LlamaProxy:
             messages: list = body.get("messages", [])
             stream: bool = body.get("stream", True)
 
-            # 提取请求来源 (使用独立模块识别)
+            # Detect request source (using a separate module)
             source = detect_source(messages, body, dict(request.headers))
-            # 调试：捕获未能精确识别为业务来源的报文，帮助完善识别正则
+            # Debug: capture requests that couldn't be confidently identified to help refine regexes
             if source in ["OpenAI", "Unknown", "Python", "Python-Req", "AioHttp"]:
                 try:
-                    with open("debug_source.log", "a", encoding="utf-8") as f_debug:
+                    debug_log_path = os.path.join(BASE_DIR, "debug_source.log")
+                    with open(debug_log_path, "a", encoding="utf-8") as f_debug:
                         f_debug.write(
                             f"\n--- [{time.strftime('%H:%M:%S')}] Source={source} ---\n"
                         )
@@ -286,14 +295,14 @@ class LlamaProxy:
                 except:
                     pass
 
-            # 强制启用缓存
+            # Force enable cache handling on the body
             body["cache_prompt"] = True
             session_id = make_session_id(messages)
 
             async with self.lock:
                 slot_id, reason = self._get_slot_for_session(session_id, messages)
 
-                # 分析缓存复用情况
+                # Analyze cache reuse
                 cached_msgs = self.slot_messages.get(slot_id, [])
                 prefix_len = common_prefix_len(messages, cached_msgs)
 
@@ -302,13 +311,13 @@ class LlamaProxy:
                 new_chars = total_chars - matched_chars
 
                 log.info(
-                    f"session={session_id[:8]} → slot={slot_id} | {reason} | "
-                    f"msgs={len(messages)} 匹配={prefix_len} 新增字符={new_chars}"
+                    f"session={session_id[:8]} -> slot={slot_id} | {reason} | "
+                    f"msgs={len(messages)} match={prefix_len} new_chars={new_chars}"
                 )
 
                 body["id_slot"] = slot_id
 
-                # 提前更新占用状态
+                # Pre-update occupancy state
                 self._bind_session(session_id, slot_id, messages, source)
                 self.slots[slot_id].processing = True
                 self._token_started[slot_id] = False
@@ -318,18 +327,18 @@ class LlamaProxy:
             try:
                 response, success = await self._forward(request, body, stream, slot_id)
                 if success:
-                    # 只有完整成功的请求才提交索引
+                    # Only commit the index for fully successful requests
                     self.slot_messages[slot_id] = list(messages)
                 else:
-                    log.warning(f"Slot {slot_id} 请求未完成，重置索引")
+                    log.warning(f"Slot {slot_id} request incomplete, resetting index")
                     self.slot_messages[slot_id] = []
                 return response
             except (Exception, asyncio.CancelledError) as e:
-                log.info(f"客户端中断 ({type(e).__name__}) - 索引已清空")
+                log.info(f"Client interrupted ({type(e).__name__}) - index cleared")
                 self.slot_messages[slot_id] = []
                 raise
             finally:
-                # 核心修复：使用 shield 确保延时不受取消影响，让 monitor 抓到最后一帧
+                # Core safeguard: use shield to ensure a short delay is not cancelled so the monitor can grab the last frame
                 try:
                     await asyncio.shield(asyncio.sleep(0.3))
                 except:
@@ -390,7 +399,7 @@ class LlamaProxy:
                                 except Exception:
                                     pass
 
-                    # 处理流结束时的粘包或未换行的末尾数据
+                    # Handle trailing buffer or a final line without newline
                     last_line = buffer.strip()
                     if last_line.startswith(b"data:") and b"[DONE]" not in last_line:
                         try:
@@ -413,11 +422,13 @@ class LlamaProxy:
                 await resp.write_eof()
                 return resp, True
             except (Exception, asyncio.CancelledError) as e:
-                # 忽略客户端断开引起的写入异常，正常返回 resp 防止 aiohttp 抛出 500
-                log.info(f"流传输中断 (客户端已断开): {type(e).__name__}")
+                # Ignore write errors caused by client disconnects; return response to avoid aiohttp 500
+                log.info(
+                    f"Stream transfer interrupted (client disconnected): {type(e).__name__}"
+                )
                 return resp, False
         else:
-            # 对于非流式请求（如 TitleGen），采用更激进的 JSON 深度搜索策略
+            # For non-stream requests (e.g., TitleGen), use an aggressive JSON deep-search parsing strategy
             async def fetch_and_parse():
                 async with self.http.post(
                     url, json=body, headers=headers, timeout=timeout
@@ -427,7 +438,7 @@ class LlamaProxy:
                         resp_text = raw_data.decode("utf-8", errors="ignore")
                         j = json.loads(resp_text)
 
-                        # 广度优先搜索所有可能的文本来源
+                        # Breadth-first search for likely text sources
                         res = ""
                         choices = j.get("choices", [])
                         if choices:
@@ -442,7 +453,7 @@ class LlamaProxy:
                             res = j.get("content") or j.get("text") or ""
 
                         if not res:
-                            # 暴力搜索 JSON 中任何长于 2 且非元数据的字符串
+                            # Bruteforce search for any string > 2 chars that is not obvious metadata
                             for key, val in j.items():
                                 if (
                                     isinstance(val, str)
@@ -461,14 +472,15 @@ class LlamaProxy:
                             )
                             self._token_started[slot_id] = True
                             log.info(
-                                f"Slot {slot_id} 非流式解析成功: {self.slots[slot_id].latest_token}"
+                                f"Slot {slot_id} non-stream parse success: {self.slots[slot_id].latest_token}"
                             )
                     except Exception as e:
-                        log.error(f"Slot {slot_id} 非流式解析失败: {e}")
+                        log.error(f"Slot {slot_id} non-stream parse failed: {e}")
                     return raw_data, upstream.status
 
             try:
-                # 即使客户端主动断开连接（如 Hermes 获取标题后立即 close），也要通过 shield 把响应读完并解析
+                # Even if the client disconnects early (e.g., Hermes closes after getting a title),
+                # use shield() to ensure we read and parse the upstream response fully.
                 data, status = await asyncio.shield(fetch_and_parse())
                 return web.Response(
                     status=status,
@@ -476,7 +488,7 @@ class LlamaProxy:
                     body=data,
                 ), (status == 200)
             except Exception as e:
-                log.error(f"Slot {slot_id} 转发异常: {e}")
+                log.error(f"Slot {slot_id} forwarding error: {e}")
                 return web.Response(status=500), False
 
     async def handle_passthrough(self, request: web.Request) -> web.Response:
@@ -531,14 +543,6 @@ class LlamaProxy:
 
 
 def main():
-    """
-    [答疑] monitor 是如何捕获远端 llama-server 的输出的？原理是什么？
-    原理：monitor.py 在后台启动了一个子线程，使用 subprocess 执行了一条 SSH 命令：
-    `ssh krsz@10.0.0.20 tail -n 0 -F /tmp/llama.log`
-    这相当于开了一个长连接管道，llama-server 只要打出一行日志，就会通过 SSH 实时推送到本地内存中。
-    我们通过正则 (re.search) 在内存中拦截 "prompt processing progress" 这行并提取进度，
-    从而完全不侵入 llama-server 的 HTTP 代码，实现了 0 延迟的 Prefill 进度获取。
-    """
     global LLAMA_URL
     parser = argparse.ArgumentParser()
     parser.add_argument("--proxy-host", type=str, default=PROXY_HOST)
@@ -556,7 +560,7 @@ def main():
     app.router.add_route("*", "/{path_info:.*}", proxy.handle_passthrough)
 
     log.info(
-        f"代理启动: {args.proxy_host}:{args.proxy_port} → {args.llama_url}  slots={args.slots}"
+        f"Proxy started: {args.proxy_host}:{args.proxy_port} -> {args.llama_url}  slots={args.slots}"
     )
     web.run_app(
         app, host=args.proxy_host, port=args.proxy_port, print=None, access_log=None
