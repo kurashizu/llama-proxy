@@ -2,26 +2,18 @@
 
 ```mermaid
 graph TD
-  Agent["Agent / Client"]
-  Proxy["Llama Proxy"]
-  Slots["Server Slots"]
-  LServer["llama-server"]
-  Monitor["Monitor (SSH tail)"]
-
-  Agent -->|POST /v1/chat/completions| Proxy
-  Proxy -->|compute session_id\n(hash of first 3 messages)| Proxy_note[/"Compute session_id\n(hash of first 3 messages)"/]
-  Proxy_note --> Proxy
-  Proxy -->|forward to mapped slot (id_slot)| Slots
-  Slots -->|internal handling\n(shared KV with --kv-unified)| LServer
-  Monitor -->|ssh tail -F /tmp/llama.log| LServer
-  LServer -->|log lines (includes prefill progress when -lv 4)| Monitor
-  Monitor -->|update UI with Prefill & slot metrics| Proxy
-  Proxy -->|response stream / JSON| Agent
+  A[Agent / Client] -- OpenAI API --> B[Llama Proxy]
+  B -- Session Affinity --> C[llama-server]
+  M[Monitor TUI] -.-> B
+  M -.-> C
+  M -. SSH Tail .-> D[(Server Logs)]
 ```
 
 ---
 
 [English](#english) | [中文](#chinese)
+
+---
 
 <a name="english"></a>
 ## English
@@ -32,14 +24,14 @@ A compact session-to-slot proxy that forwards OpenAI-compatible chat completion 
 > ⚠️ Important: This project is agent-agnostic. Any client or agent that issues OpenAI-compatible chat completion HTTP requests can use this proxy.
 
 ### Key features
-- 🔗 Session affinity (session → slot) so the same conversation reuses the same slot.
-- 🧠 Cost-aware eviction: prefers evicting short/cheap contexts and preserves long/expensive histories.
-- 🔒 Deterministic session ID: hash of the full text of the first three messages (role + content).
-- 🛡️ Robust handling of cancellations and client disconnects to avoid slot state corruption.
-- 📡 Prefill progress monitoring: monitor SSH-tails llama-server logs and extracts progress (requires verbose server logs).
+- 🔗 **Session affinity** (session → slot) so the same conversation reuses the same slot.
+- 🧠 **Cost-aware eviction**: prefers evicting short/cheap contexts and preserves long/expensive histories.
+- 🔒 **Deterministic session ID**: hash of the full text of the first three messages (role + content).
+- 🛡️ **Robust handling** of cancellations and client disconnects to avoid slot state corruption.
+- 📡 **Prefill progress monitoring**: monitor SSH-tails llama-server logs and extracts progress (requires verbose server logs).
 
 ### Requirements
-- Python 3.8+ with these common dependencies: `aiohttp`, `pyyaml`, `rich`, `requests`.
+- Python 3.8+ with common dependencies: `aiohttp`, `pyyaml`, `rich`, `requests`.
 - A running `llama-server` (llama.cpp server) reachable from the proxy.
 - For Prefill progress monitoring: start `llama-server` with verbose logs (`-lv 4`) and redirect logs to a file accessible via SSH from the machine running the monitor.
 - If you use `--kv-unified` on the server, it is strongly recommended to add `--cache-ram 0` to avoid server memory-level cache silently clearing GPU KV pools (which can cause desyncs).
@@ -130,6 +122,14 @@ Integration notes for agents:
 - Keep the OpenAI Chat Completions request shape (messages array).
 - Provide a stable `user` field or deterministic system prompt to help session hashing and source detection.
 
+### Troubleshooting
+- Prefill shows `waiting...` while model responds quickly:
+  - Fast responses may skip verbose prefill log lines. Inspect `proxy.log` and `llama.log` for parsing clues.
+- Unexpected slot eviction / context loss:
+  - Verify `--cache-ram 0` when using `--kv-unified`. Inspect `/proxy/status` for `evict_score` and consider increasing slots or server `--parallel`.
+- Session mismatch due to differing system prompts:
+  - Avoid timestamps or ephemeral metadata in system prompts. Use deterministic system prompts or set a stable `user` field.
+
 ---
 
 <a name="chinese"></a>
@@ -141,11 +141,11 @@ Integration notes for agents:
 > ⚠️ 重要：本项目与具体 agent 无关，任何能发送 OpenAI 兼容 HTTP 请求的客户端或 agent 都可以接入本代理。
 
 ### 核心特性
-- 🔗 会话亲和（session → slot），相同对话复用同一槽位。
-- 🧠 成本感知驱逐：优先驱逐短小/低成本会话，保护长对话及高重算成本历史。
-- 🔒 稳定的会话 ID：基于前 3 条消息（role + content）的全文哈希生成。
-- 🛡️ 对取消、断连和快速切换通道具备鲁棒性，避免槽位状态错乱。
-- 📡 Prefill 监控：通过 SSH tail 远端 llama-server 日志提取进度（需要服务器输出详细日志）。
+- 🔗 **会话亲和**（session → slot），相同对话复用同一槽位。
+- 🧠 **成本感知驱逐**：优先驱逐短小/低成本会话，保护长会话及高重算成本历史。
+- 🔒 **稳定的会话 ID**：基于前 3 条消息（role + content）的全文哈希生成。
+- 🛡️ **对取消、断连和快速切换通道具备鲁棒性**，避免槽位状态错乱。
+- 📡 **Prefill 监控**：通过 SSH tail 远端 llama-server 日志提取进度（需要服务器输出详细日志）。
 
 ### 前提要求
 - Python 3.8+（常用依赖：`aiohttp`, `pyyaml`, `rich`, `requests`）。
@@ -235,5 +235,3 @@ curl -N -X POST "http://localhost:8888/v1/chat/completions" \
   - 检查是否使用了 `--cache-ram 0`（当使用 `--kv-unified` 时）。查看 `/proxy/status` 的 `evict_score` 并根据需要增加槽位或调整 server 的 `--parallel`。
 - 会话匹配错误（因 system prompt 不同）：
   - 避免在 system prompt 中插入时间戳或临时元数据。使用确定性的 system prompt 或在请求中传入稳定的 `user` 字段。
-
----
