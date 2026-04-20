@@ -1,0 +1,9 @@
+proxy:
+  host: "0.0.0.0"
+  port: 8888
+  slots: 4
+
+llama_server:
+  url: "http://10.0.0.20:11400"
+  ssh_host: "krsz@10.0.0.20"
+  log_path: "/tmp/llama.log"

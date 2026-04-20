@@ -1,1 +1,1 @@
-uv run --with flask --with requests proxy.py
+uv run --with aiohttp --with pyyaml proxy.py
