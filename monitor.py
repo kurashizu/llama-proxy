@@ -14,133 +14,83 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# --------------------------------------------------
-# Configuration loading
-# --------------------------------------------------
-# The project resides in the llama-proxy folder; use a relative path to locate config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
 
-try:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-except Exception:
-    config = {}
 
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            pass
+    return {}
+
+
+config = load_config()
 PROXY_HOST = config.get("proxy", {}).get("host", "127.0.0.1")
 PROXY_PORT = config.get("proxy", {}).get("port", 8888)
-# If proxy listens on 0.0.0.0, use 127.0.0.1 for local queries
 PROXY_URL = f"http://{'127.0.0.1' if PROXY_HOST == '0.0.0.0' else PROXY_HOST}:{PROXY_PORT}/proxy/status"
 
-LLAMA_BASE_URL = config.get("llama_server", {}).get("url", "http://10.0.0.20:11400")
-LLAMA_URL = f"{LLAMA_BASE_URL}/slots"
-
-SSH_HOST = config.get("llama_server", {}).get("ssh_host", "krsz@10.0.0.20")
-LLAMA_LOG_PATH = config.get("llama_server", {}).get("log_path", "/tmp/llama.log")
-
-
-# --------------------------------------------------
-# Global data and utilities
-# --------------------------------------------------
+SSH_HOST = config.get("llama_server", {}).get("ssh_host", "")
+LOG_PATH = config.get("llama_server", {}).get("log_path", "/tmp/llama.log")
 
 state_lock = threading.Lock()
 proxy_data = {}
-llama_data = {}
-prefill_progress = {}
-last_task_ids = {}
-proxy_logs = deque(maxlen=8)
+proxy_logs = deque(maxlen=10)
+remote_events = {}
+slot_stats = {}
+slot_buffers = {}
 
 
 def human_format(num):
-    """Format large numbers into k, M, G units, showing integer-style output."""
     if num is None:
         return "0"
     try:
         num = float(num)
-    except (ValueError, TypeError):
+    except:
         return str(num)
-
     magnitude = 0
     while abs(num) >= 1000 and magnitude < 4:
         magnitude += 1
         num /= 1000.0
-
     if magnitude == 0:
         return str(int(num))
-
     val = f"{num:.1f}".rstrip("0").rstrip(".")
     return f"{val}{['', 'k', 'M', 'G', 'T'][magnitude]}"
 
 
-# --------------------------------------------------
-# Background data collection threads
-# --------------------------------------------------
+def strip_ansi(text):
+    return re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])").sub("", text)
 
 
-def fetch_proxy():
-    """Periodically fetch /proxy/status from the local proxy for UI data."""
+def fetch_proxy_loop():
     global proxy_data
     while True:
         try:
-            data = requests.get(PROXY_URL, timeout=1).json()
-            with state_lock:
-                proxy_data = data
+            resp = requests.get(PROXY_URL, timeout=1)
+            if resp.status_code == 200:
+                data = resp.json()
+                with state_lock:
+                    proxy_data = data
+            else:
+                with state_lock:
+                    proxy_data = {}
         except Exception:
             with state_lock:
                 proxy_data = {}
         time.sleep(0.5)
 
 
-def tail_proxy_log():
-    """Tail the local proxy.log file and keep recent events for display."""
-    global proxy_logs
-    # Log file path relative to the project directory
+def tail_proxy_log_loop():
     log_file = os.path.join(BASE_DIR, "proxy.log")
-    cmd = ["tail", "-n", "0", "-F", log_file]
-    try:
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-        )
-        for line in iter(p.stdout.readline, ""):
-            if not line:
-                break
-            if "/proxy/status" in line:
-                continue
-            with state_lock:
-                proxy_logs.append(line.strip())
-    except Exception:
-        pass
-
-
-def fetch_llama():
-    """Periodically query the llama-server /slots endpoint to enrich the UI."""
-    global llama_data
     while True:
+        if not os.path.exists(log_file):
+            time.sleep(2)
+            continue
         try:
-            data = requests.get(LLAMA_URL, timeout=1).json()
-            with state_lock:
-                # convert list to dict keyed by slot id for fast lookup
-                llama_data = {slot["id"]: slot for slot in data}
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-
-def tail_llama_log():
-    """
-    SSH-tail the remote llama-server log and extract Prefill/progress lines.
-
-    Expected log lines contain phrases like "prompt processing progress" and "prompt processing done".
-    The monitor extracts the slot id and progress value and stores them in prefill_progress.
-    """
-    global prefill_progress
-    while True:
-        cmd = ["ssh", SSH_HOST, f"tail -n 0 -F {LLAMA_LOG_PATH}"]
-        try:
+            cmd = ["tail", "-n", "0", "-F", log_file]
             p = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -149,45 +99,117 @@ def tail_llama_log():
                 bufsize=1,
             )
             for line in iter(p.stdout.readline, ""):
-                if not line:
-                    break
-                if "prompt processing progress" in line:
-                    m = re.search(r"id\s+(\d+)\s*\|.*progress = (0\.\d+|1\.\d+)", line)
-                    if m:
-                        slot_id = int(m.group(1))
-                        prog = float(m.group(2))
-                        with state_lock:
-                            prefill_progress[slot_id] = prog
-                elif "prompt processing done" in line:
-                    m = re.search(r"id\s+(\d+)\s*\|", line)
-                    if m:
-                        slot_id = int(m.group(1))
-                        with state_lock:
-                            prefill_progress[slot_id] = 1.0
-                elif "stop processing" in line or "release:" in line:
-                    m = re.search(r"id\s+(\d+)\s*\|", line)
-                    if m:
-                        slot_id = int(m.group(1))
-                        with state_lock:
-                            prefill_progress.pop(slot_id, None)
+                if not line or "/proxy/status" in line:
+                    continue
+                with state_lock:
+                    proxy_logs.append(line.strip())
+            p.wait()
         except Exception:
-            pass
-        time.sleep(2)
+            time.sleep(2)
 
 
-# --------------------------------------------------
-# UI layout and rendering
-# --------------------------------------------------
+def tail_remote_llama_log_loop():
+    if not SSH_HOST:
+        return
+    while True:
+        try:
+            cmd = ["ssh", SSH_HOST, f"tail -n 0 -F {LOG_PATH}"]
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            for raw_line in iter(p.stdout.readline, ""):
+                if not raw_line:
+                    break
+                line = strip_ansi(raw_line)
+                now = time.time()
+                m_id = re.search(r"id\s+(\d+)", line)
+                if not m_id:
+                    continue
+                slot_id = int(m_id.group(1))
+
+                if "stopped by EOS" in line or "release:" in line:
+                    with state_lock:
+                        remote_events.pop(slot_id, None)
+                        slot_stats.pop(slot_id, None)
+                        slot_buffers.pop(slot_id, None)
+                    continue
+
+                m_prog = re.search(r"progress\s*[:=,]\s*([0-9.]+)", line)
+                m_tokens = re.search(r"n_tokens\s*[:=,]\s*(\d+)", line)
+                m_dec = re.search(r"n_decoded\s*[:=,]\s*(\d+)", line)
+                m_rem = re.search(r"n_remaining\s*[:=,]\s*(-?\d+)", line)
+
+                event_text = ""
+                if m_prog:
+                    prog_val = float(m_prog.group(1))
+                    speed_suffix = ""
+                    with state_lock:
+                        s = slot_stats.get(
+                            slot_id, {"last_n": 0, "last_t": now, "total": 0}
+                        )
+                        if m_tokens:
+                            s["total"] = int(m_tokens.group(1))
+                        total_tokens = s["total"]
+                        current_n = prog_val * total_tokens
+                        if now > s["last_t"] and current_n > s["last_n"]:
+                            speed = (current_n - s["last_n"]) / (now - s["last_t"])
+                            speed_suffix = f" | {speed:.1f} T/s"
+                        s.update({"last_n": current_n, "last_t": now})
+                        slot_stats[slot_id] = s
+                    event_text = f"[bold yellow]Slot {slot_id}: Prefill {prog_val * 100:.1f}% ({total_tokens} T){speed_suffix}[/bold yellow]"
+                elif m_dec or m_rem:
+                    n_dec_val = int(m_dec.group(1)) if m_dec else 0
+                    rem_val = m_rem.group(1) if m_rem else "?"
+                    speed_suffix = ""
+                    with state_lock:
+                        s = slot_stats.get(
+                            slot_id, {"last_n": 0, "last_t": now, "total": 0}
+                        )
+                        if now > s["last_t"] and n_dec_val > s["last_n"]:
+                            speed = (n_dec_val - s["last_n"]) / (now - s["last_t"])
+                            speed_suffix = f" | {speed:.1f} T/s"
+                        s.update({"last_n": n_dec_val, "last_t": now})
+                        slot_stats[slot_id] = s
+                    if rem_val == "-1":
+                        rem_val = "∞"
+                    event_text = f"[bold cyan]Slot {slot_id}: Decoding {human_format(n_dec_val)} T (rem: {rem_val}){speed_suffix}[/bold cyan]"
+
+                    m_token = re.search(r"next token:\s*\d+\s*'(.*)'", line)
+                    if m_token:
+                        t = m_token.group(1).replace("\\n", " ").replace("\\t", " ")
+                        with state_lock:
+                            slot_buffers[slot_id] = (slot_buffers.get(slot_id, "") + t)[
+                                -80:
+                            ]
+
+                if event_text:
+                    with state_lock:
+                        remote_events[slot_id] = {"text": event_text, "time": now}
+            p.wait()
+        except Exception:
+            time.sleep(5)
 
 
 def generate_layout():
-    """Construct the Rich layout used for live monitoring."""
-    global last_task_ids
+    now = time.time()
     with state_lock:
         p_data = dict(proxy_data)
-        l_data = dict(llama_data)
-        prog_data = dict(prefill_progress)
         logs = list(proxy_logs)
+        stale = [sid for sid, data in remote_events.items() if now - data["time"] > 20]
+        for sid in stale:
+            remote_events.pop(sid)
+            slot_stats.pop(sid, None)
+            slot_buffers.pop(sid, None)
+
+        r_events = []
+        for sid, data in remote_events.items():
+            r_events.append(data["text"])
+            if sid in slot_buffers:
+                r_events.append(f"[dim]  > {slot_buffers[sid]}[/dim]")
 
     layout = Layout()
     layout.split_column(
@@ -196,189 +218,96 @@ def generate_layout():
         Layout(name="footer", size=10),
     )
 
-    # 1. Header area
     proxy_online = bool(p_data)
-    proxy_status = (
-        "[bold green]ONLINE[/bold green]"
-        if proxy_online
-        else "[bold red]OFFLINE[/bold red]"
-    )
-    num_slots = p_data.get("num_slots", "?")
     header_text = Text.from_markup(
-        f"[bold cyan]Llama Proxy Monitor[/bold cyan] | Status: {proxy_status} | [bold cyan]Slots: {num_slots}[/bold cyan]",
+        f"[bold cyan]Llama Proxy Monitor[/bold cyan] | Status: {'[bold green]ONLINE[/bold green]' if proxy_online else '[bold red]OFFLINE[/bold red]'} | [bold cyan]Slots: {p_data.get('num_slots', '?')}[/bold cyan]",
         justify="center",
     )
     layout["header"].update(Panel(header_text))
 
-    # 2. Slot resource allocation table (with row separators)
     res_table = Table(
         expand=True, show_header=True, header_style="bold magenta", show_lines=True
     )
     res_table.add_column("Slot", justify="center", ratio=1)
-    res_table.add_column("State", justify="center", ratio=3)
+    res_table.add_column("State", justify="center", ratio=2)
+    res_table.add_column("Session", justify="center", ratio=2)
     res_table.add_column("Msgs", justify="center", ratio=1)
-    res_table.add_column("Total Chars", justify="center", ratio=4)
+    res_table.add_column("Total Chars", justify="center", ratio=2)
     res_table.add_column("Evict Score", justify="center", ratio=2)
-    res_table.add_column("Progress / Status", justify="center", ratio=5)
-
-    # 3. Real-time token stream table (includes SessionID and Source)
-    token_table = Table(
-        expand=True, show_header=True, header_style="bold blue", show_lines=True
-    )
-    token_table.add_column("Slot", justify="center", ratio=1)
-    token_table.add_column("Session", justify="center", ratio=2)
-    token_table.add_column("Source", justify="center", ratio=2)
-    token_table.add_column("Live Generated Tokens", justify="left", ratio=10)
 
     slots = p_data.get("slots", [])
-
-    # Precompute the highest evict score among non-processing slots for styling
-    max_score = -1.0
-    for slot in slots:
-        if not slot.get("processing") and slot.get("session_id"):
-            score = slot.get("evict_score", 0)
-            if score > max_score:
-                max_score = score
+    max_score = max(
+        [
+            s.get("evict_score", 0)
+            for s in slots
+            if not s.get("processing") and s.get("session_id")
+        ]
+        or [-1]
+    )
 
     for slot in slots:
         s_id = slot["slot_id"]
-        is_processing = slot.get("processing", False)
-
-        # Task switch detection and progress cleanup
-        l_slot = l_data.get(s_id, {})
-        current_task_id = l_slot.get("id_task", -1)
-        if last_task_ids.get(s_id) != current_task_id:
-            with state_lock:
-                prefill_progress.pop(s_id, None)
-            last_task_ids[s_id] = current_task_id
-
-        # State text
-        if is_processing:
-            state = "[bold red]Processing[/bold red]"
-        elif slot.get("session_id"):
-            state = "[green]Idle (Cached)[/green]"
-        else:
-            state = "[dim]Empty[/dim]"
-
-        # Evict score display logic
+        is_proc = slot.get("processing", False)
+        sid = slot.get("session_id")
+        state = (
+            "[bold red]Processing[/bold red]"
+            if is_proc
+            else ("[green]Idle (Cached)[/green]" if sid else "[dim]Empty[/dim]")
+        )
         raw_score = slot.get("evict_score", 0)
-        score_val = int(raw_score)
-        if is_processing or not slot.get("session_id"):
-            evict_score = Text("-", style="dim")
-        else:
-            # Highlight highest score in red
-            style = (
-                "bold red" if (max_score > 0 and raw_score >= max_score) else "white"
-            )
-            evict_score = Text(str(score_val), style=style)
-
-        # Detailed running status (Prefill / Generating)
-        op_status = "[dim]-[/dim]"
-        n_decoded = 0
-        latest_token = slot.get("latest_token", "")
-        source = slot.get("source", "")
-
-        if is_processing:
-            if "next_token" in l_slot and len(l_slot["next_token"]) > 0:
-                n_decoded = l_slot["next_token"][0].get("n_decoded", 0)
-
-            if latest_token and n_decoded > 0:
-                op_status = (
-                    f"[bold cyan]Generating ({human_format(n_decoded)} T)[/bold cyan]"
-                )
-            elif source == "TitleGen":
-                op_status = "[bold green]Generating Title...[/bold green]"
-            else:
-                prog = prog_data.get(s_id, -1.0)
-                if prog >= 0:
-                    op_status = f"[bold yellow]Prefill: {prog * 100:.1f}%[/bold yellow]"
-                elif (
-                    slot.get("matched_chars", 0) > 0 and slot.get("new_chars", 0) < 1500
-                ):
-                    op_status = "[bold green]Fast Cache Hit[/bold green]"
-                else:
-                    op_status = "[bold yellow]Prefill...[/bold yellow]"
-
-        # Character statistics (show matched + new when processing)
-        total_chars = slot.get("char_count", 0)
-        new_chars = slot.get("new_chars", 0)
-        if is_processing and new_chars > 0:
-            matched = total_chars - new_chars
-            char_display = f"{human_format(matched)} [bold yellow](+{human_format(new_chars)})[/bold yellow]"
-        else:
-            char_display = human_format(total_chars)
+        score_style = (
+            "bold red"
+            if (not is_proc and sid and raw_score >= max_score > 0)
+            else "white"
+        )
+        evict_score = (
+            Text(str(int(raw_score)), style=score_style)
+            if (not is_proc and sid)
+            else Text("-", style="dim")
+        )
 
         res_table.add_row(
             str(s_id),
             state,
+            str(sid[:8]) if sid else "[dim]-[/dim]",
             human_format(slot.get("msg_count", 0)),
-            char_display,
+            human_format(slot.get("char_count", 0)),
             evict_score,
-            op_status,
         )
 
-        # Fill token stream table
-        session_id = slot.get("session_id")
-        if session_id:
-            if not latest_token and is_processing:
-                if source == "TitleGen":
-                    token_display = (
-                        "[italic yellow]summarizing title...[/italic yellow]"
-                    )
-                else:
-                    token_display = "[italic dim]waiting for model...[/italic dim]"
-            elif latest_token:
-                token_display = f"[green]{latest_token}[/green]"
-            else:
-                token_display = "[dim]-[/dim]"
-
-            token_table.add_row(
-                f"{s_id}",
-                session_id[:8],
-                source[:15],
-                token_display,
-            )
-
-    # 4. Footer: queue status and recent logs
     waiting = p_data.get("waiting_requests", 0)
-    queue_style = "bold yellow" if waiting > 0 else "dim"
-    queue_text = Text(f"Waitlist: {waiting}", style=queue_style, justify="center")
-
-    log_text = Text()
-    for log_entry in logs:
-        cleaned_log = re.sub(r"^\d{2}:\d{2}:\d{2} ", "", log_entry)
-        if "[ERROR]" in cleaned_log:
-            log_text.append(cleaned_log + "\n", style="bold red")
-        elif "[WARNING]" in cleaned_log:
-            log_text.append(cleaned_log + "\n", style="yellow")
-        else:
-            log_text.append(cleaned_log + "\n", style="dim white")
-
-    main_layout = Layout()
-    main_layout.split_column(
-        Layout(Panel(res_table, title="Slot Resource Allocation"), ratio=3),
-        Layout(Panel(token_table, title="Real-time Token Streams"), ratio=2),
+    wait_txt = Text.from_markup(
+        f"Waitlist: [bold yellow]{waiting}[/bold yellow]"
+        if waiting > 0
+        else "Waitlist: [dim]0[/dim]"
     )
-    layout["main"].update(main_layout)
+    main_lay = Layout()
+    main_lay.split_column(Layout(res_table, ratio=1), Layout(wait_txt, size=1))
+    layout["main"].update(Panel(main_lay, title="Slot Resource Allocation"))
 
-    footer_layout = Layout()
-    footer_layout.split_row(
-        Layout(Panel(queue_text, title="Queue"), ratio=1),
-        Layout(Panel(log_text, title="Recent Events"), ratio=3),
-    )
-    layout["footer"].update(footer_layout)
+    ev_text = Text()
+    for rev in r_events:
+        ev_text.append(Text.from_markup(rev + "\n"))
+    if r_events:
+        ev_text.append("-" * 20 + "\n", style="dim")
+    for entry in logs:
+        clean = re.sub(r"^\d{2}:\d{2}:\d{2} ", "", entry)
+        ev_text.append(
+            clean + "\n",
+            style="bold red"
+            if "[ERROR]" in clean
+            else ("yellow" if "[WARNING]" in clean else "dim white"),
+        )
+    layout["footer"].update(Panel(ev_text, title="Events"))
+
     return layout
 
 
 def main():
-    # Start background threads for fetching proxy and llama data and for tailing logs
-    threading.Thread(target=fetch_proxy, daemon=True).start()
-    threading.Thread(target=fetch_llama, daemon=True).start()
-    threading.Thread(target=tail_llama_log, daemon=True).start()
-    threading.Thread(target=tail_proxy_log, daemon=True).start()
-
-    time.sleep(1)
-
+    threading.Thread(target=fetch_proxy_loop, daemon=True).start()
+    threading.Thread(target=tail_proxy_log_loop, daemon=True).start()
+    threading.Thread(target=tail_remote_llama_log_loop, daemon=True).start()
+    time.sleep(0.5)
     with Live(generate_layout(), refresh_per_second=4, screen=True) as live:
         while True:
             try:
